@@ -11,24 +11,62 @@ app = Flask(__name__)
 
 TARGET_DURATION = 20.0
 MAX_CLIPS = 7
-MIN_CLIPS = 4
 
+
+# ==========================================================
+# DOWNLOAD
+# ==========================================================
 
 def download_file(url, dst):
-    with requests.get(url, stream=True, timeout=120) as r:
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    with requests.get(
+        url,
+        stream=True,
+        timeout=120,
+        allow_redirects=True,
+        headers=headers
+    ) as r:
+
         r.raise_for_status()
+
+        content_type = (
+            r.headers.get("Content-Type", "")
+            .lower()
+        )
+
+        # Google Drive login/error page instead of actual media
+        if "text/html" in content_type:
+            raise RuntimeError(
+                f"Download returned HTML instead of media: {url}"
+            )
+
         with open(dst, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
+            for chunk in r.iter_content(
+                chunk_size=1024 * 1024
+            ):
                 if chunk:
                     f.write(chunk)
 
+    if os.path.getsize(dst) < 1000:
+        raise RuntimeError(
+            f"Downloaded file is unexpectedly small: {dst}"
+        )
+
+
+# ==========================================================
+# FFPROBE
+# ==========================================================
 
 def probe_duration(path):
     cmd = [
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path)
     ]
 
@@ -41,161 +79,181 @@ def probe_duration(path):
 
     if p.returncode != 0:
         raise RuntimeError(
-            "FFPROBE ERROR:\n" + p.stderr[-3000:]
+            "FFPROBE ERROR:\n"
+            + p.stderr[-3000:]
         )
 
     try:
-        return float(p.stdout.strip())
+        return float(
+            p.stdout.strip()
+        )
+
     except Exception:
         raise RuntimeError(
-            f"Could not detect duration for {path}"
+            f"Unable to detect duration: {path}"
         )
 
 
-def normalize_clip_plan(raw_plan, master_duration):
-    """
-    Ignore FAL's written duration field.
-    Real duration always comes from:
-        source_end - source_start
+# ==========================================================
+# CLIP PLAN
+# ==========================================================
 
-    Then force final plan to exactly 20.0 seconds.
+def normalize_clip_plan(
+    raw_plan,
+    master_duration
+):
+    """
+    Ignore FAL's written duration.
+    Timestamp arithmetic is source of truth.
+
+    Keep max 7 clips.
+    Extend existing real clips when total <20s.
+    Shorten clips when total >20s.
     """
 
     clips = []
 
-    for i, clip in enumerate(raw_plan):
-        start = float(clip["source_start"])
-        end = float(clip["source_end"])
+    for clip in raw_plan:
 
-        start = max(0.0, min(start, master_duration))
-        end = max(0.0, min(end, master_duration))
+        start = float(
+            clip["source_start"]
+        )
 
-        real_duration = end - start
+        end = float(
+            clip["source_end"]
+        )
 
-        if real_duration <= 0:
+        start = max(
+            0.0,
+            min(start, master_duration)
+        )
+
+        end = max(
+            0.0,
+            min(end, master_duration)
+        )
+
+        duration = end - start
+
+        if duration <= 0:
             continue
 
         clips.append({
-            "index": i,
             "source_start": start,
             "source_end": end,
-            "duration": real_duration
+            "duration": duration
         })
 
-    if len(clips) < MIN_CLIPS:
+    if not clips:
         raise ValueError(
-            f"clip_plan has only {len(clips)} valid clips; minimum is {MIN_CLIPS}"
+            "No valid clips in clip_plan"
         )
 
-    # If FAL outputs 8, 10, 13 clips etc:
-    # preserve first clip as hook, then keep strongest/longest clips.
+    # Avoid giant FAL clip plans
     if len(clips) > MAX_CLIPS:
-        first = clips[0]
+        clips = clips[:MAX_CLIPS]
 
-        remaining = sorted(
-            clips[1:],
-            key=lambda x: x["duration"],
-            reverse=True
-        )[:MAX_CLIPS - 1]
-
-        selected = [first] + remaining
-
-        # Restore original creative order
-        clips = sorted(
-            selected,
-            key=lambda x: x["index"]
-        )
-
-    actual_total = sum(
-        c["duration"] for c in clips
+    total = sum(
+        c["duration"]
+        for c in clips
     )
 
-    if actual_total <= 0:
-        raise ValueError("Invalid clip_plan duration")
+    # ======================================================
+    # SHORT PLAN -> extend existing clips
+    # ======================================================
 
-    # Scale existing real clips proportionally toward 20 seconds.
-    scale = TARGET_DURATION / actual_total
+    remaining = (
+        TARGET_DURATION - total
+    )
 
-    for c in clips:
-        desired = c["duration"] * scale
+    if remaining > 0.001:
 
-        # Cannot extend beyond end of MASTER
-        max_forward = master_duration - c["source_start"]
+        # Spread additional time across clips
+        while remaining > 0.001:
 
-        c["duration"] = min(
-            desired,
-            max_forward
-        )
+            changed = False
 
-        c["source_end"] = (
-            c["source_start"] + c["duration"]
-        )
+            for c in clips:
 
-    # If some clips hit MASTER boundary, distribute remaining time
-    # into other existing clips.
-    total = sum(c["duration"] for c in clips)
-    remaining = TARGET_DURATION - total
+                available = (
+                    master_duration
+                    - c["source_end"]
+                )
 
-    if remaining > 0.0001:
-        for c in clips:
-            available = (
-                master_duration - c["source_end"]
-            )
+                if available <= 0:
+                    continue
 
-            if available <= 0:
-                continue
+                add = min(
+                    available,
+                    remaining,
+                    1.0
+                )
 
-            add = min(
-                available,
-                remaining
-            )
+                c["source_end"] += add
+                c["duration"] += add
 
-            c["duration"] += add
-            c["source_end"] += add
-            remaining -= add
+                remaining -= add
+                changed = True
 
-            if remaining <= 0.0001:
+                if remaining <= 0.001:
+                    break
+
+            if not changed:
                 break
 
-    # If still short, extend clip starts backwards using real footage.
-    if remaining > 0.0001:
-        for c in reversed(clips):
-            available = c["source_start"]
+        # If forward extension not enough,
+        # extend starts backwards
+        if remaining > 0.001:
 
-            if available <= 0:
-                continue
+            for c in reversed(clips):
 
-            add = min(
-                available,
-                remaining
-            )
+                available = (
+                    c["source_start"]
+                )
 
-            c["source_start"] -= add
-            c["duration"] += add
-            remaining -= add
+                if available <= 0:
+                    continue
 
-            if remaining <= 0.0001:
-                break
+                add = min(
+                    available,
+                    remaining
+                )
+
+                c["source_start"] -= add
+                c["duration"] += add
+
+                remaining -= add
+
+                if remaining <= 0.001:
+                    break
 
     if remaining > 0.01:
         raise ValueError(
-            f"Cannot expand real MASTER footage to {TARGET_DURATION}s"
+            "Not enough real MASTER footage "
+            "to build 20 seconds"
         )
 
-    # If rounding/scaling caused total slightly above 20,
-    # trim excess from longest clips.
-    total = sum(c["duration"] for c in clips)
-    excess = total - TARGET_DURATION
+    # ======================================================
+    # LONG PLAN -> shorten
+    # ======================================================
 
-    if excess > 0.0001:
-        for c in sorted(
-            clips,
-            key=lambda x: x["duration"],
-            reverse=True
-        ):
+    total = sum(
+        c["duration"]
+        for c in clips
+    )
+
+    excess = (
+        total - TARGET_DURATION
+    )
+
+    if excess > 0.001:
+
+        for c in reversed(clips):
+
+            # Keep minimum useful clip length
             reducible = max(
                 0.0,
-                c["duration"] - 0.2
+                c["duration"] - 0.5
             )
 
             cut = min(
@@ -203,17 +261,22 @@ def normalize_clip_plan(raw_plan, master_duration):
                 excess
             )
 
-            c["duration"] -= cut
             c["source_end"] -= cut
+            c["duration"] -= cut
+
             excess -= cut
 
-            if excess <= 0.0001:
+            if excess <= 0.001:
                 break
 
-    # Round cleanly
+    # ======================================================
+    # ROUND
+    # ======================================================
+
     cleaned = []
 
     for c in clips:
+
         start = round(
             c["source_start"], 3
         )
@@ -232,89 +295,150 @@ def normalize_clip_plan(raw_plan, master_duration):
             "duration": duration
         })
 
-    # Final exact correction after rounding
-    final_total = sum(
-        c["duration"] for c in cleaned
-    )
-
-    diff = round(
-        TARGET_DURATION - final_total,
-        3
-    )
-
-    if abs(diff) > 0:
-        # Try adding/removing difference from last usable clip
-        for c in reversed(cleaned):
-
-            new_duration = round(
-                c["duration"] + diff,
-                3
-            )
-
-            new_end = round(
-                c["source_start"] + new_duration,
-                3
-            )
-
-            if (
-                new_duration > 0
-                and new_end <= master_duration
-            ):
-                c["duration"] = new_duration
-                c["source_end"] = new_end
-                break
-
-    # Absolute final validation
-    verified_total = round(
+    # Final tiny rounding correction
+    total = round(
         sum(
-            c["source_end"] - c["source_start"]
+            c["duration"]
             for c in cleaned
         ),
         3
     )
 
-    if verified_total != TARGET_DURATION:
-        raise ValueError(
-            f"Normalized clip total is {verified_total}s, expected 20.0s"
+    diff = round(
+        TARGET_DURATION - total,
+        3
+    )
+
+    if abs(diff) > 0:
+
+        c = cleaned[-1]
+
+        new_duration = round(
+            c["duration"] + diff,
+            3
         )
+
+        new_end = round(
+            c["source_start"]
+            + new_duration,
+            3
+        )
+
+        if (
+            new_duration > 0
+            and new_end <= master_duration
+        ):
+            c["duration"] = new_duration
+            c["source_end"] = new_end
 
     return cleaned
 
+
+# ==========================================================
+# ATEMPO
+# ==========================================================
+
+def build_atempo(speed):
+    """
+    FFmpeg atempo is safest between 0.5 and 2.0.
+    Chain filters if speed is larger.
+    """
+
+    if speed <= 1.0001:
+        return "apad"
+
+    parts = []
+
+    while speed > 2.0:
+        parts.append("atempo=2.0")
+        speed /= 2.0
+
+    parts.append(
+        f"atempo={speed:.6f}"
+    )
+
+    parts.append("apad")
+
+    return ",".join(parts)
+
+
+# ==========================================================
+# HEALTH
+# ==========================================================
 
 @app.get("/")
 def health():
     return {
         "ok": True,
-        "service": "syiema-video-render"
+        "service": "syiema-video-render-fast"
     }
 
 
+# ==========================================================
+# RENDER
+# ==========================================================
+
 @app.post("/render")
 def render():
+
     try:
-        data = request.get_json(force=True)
 
-        master_url = data["master_url"]
-        voiceover_url = data["voiceover_url"]
-        clip_plan = data["clip_plan"]
+        data = request.get_json(
+            force=True
+        )
 
-        if isinstance(clip_plan, str):
-            clip_plan = json.loads(clip_plan)
+        master_url = data[
+            "master_url"
+        ]
+
+        voiceover_url = data[
+            "voiceover_url"
+        ]
+
+        clip_plan = data[
+            "clip_plan"
+        ]
+
+        if isinstance(
+            clip_plan,
+            str
+        ):
+            clip_plan = json.loads(
+                clip_plan
+            )
 
         if not clip_plan:
             return jsonify({
-                "error": "clip_plan is empty"
+                "error":
+                "clip_plan is empty"
             }), 400
 
+        # ==================================================
+        # TEMP
+        # ==================================================
+
         work = Path(
-            tempfile.mkdtemp(prefix="render_")
+            tempfile.mkdtemp(
+                prefix="render_"
+            )
         )
 
-        master = work / "master.mp4"
-        voice = work / "voice_input"
-        output = work / "rendered.mp4"
+        master = (
+            work / "master.mp4"
+        )
 
-        # Download source files
+        voice = (
+            work / "voice.mp3"
+        )
+
+        output = (
+            work / "rendered.mp4"
+        )
+
+        # ==================================================
+        # DOWNLOAD
+        # ==================================================
+
         download_file(
             master_url,
             master
@@ -325,59 +449,78 @@ def render():
             voice
         )
 
-        # Detect real durations
-        master_duration = probe_duration(
-            master
+        # ==================================================
+        # DURATIONS
+        # ==================================================
+
+        master_duration = (
+            probe_duration(master)
         )
 
-        voice_duration = probe_duration(
-            voice
+        voice_duration = (
+            probe_duration(voice)
         )
 
-        # ======================================================
-        # AUTO-CORRECT FAL CLIP PLAN
-        # ======================================================
+        # ==================================================
+        # FIX FAL PLAN
+        # ==================================================
 
-        fixed_plan = normalize_clip_plan(
-            clip_plan,
-            master_duration
+        fixed_plan = (
+            normalize_clip_plan(
+                clip_plan,
+                master_duration
+            )
         )
 
-        # ======================================================
-        # AUTO-FIT VOICEOVER
-        # ======================================================
+        # ==================================================
+        # VO SPEED
+        # ==================================================
 
-        # If VO >20s, speed it up enough to finish inside 20s.
-        # Example:
-        # 23s -> 1.15x
-        # 27s -> 1.35x
-        #
-        # If VO <=20s, keep natural 1.0x and pad silence.
-        if voice_duration > TARGET_DURATION:
+        if (
+            voice_duration
+            > TARGET_DURATION
+        ):
+
             voice_speed = (
                 voice_duration
                 / TARGET_DURATION
             )
+
         else:
+
             voice_speed = 1.0
 
-        # ======================================================
-        # BUILD VIDEO FILTER
-        # ======================================================
+        audio_chain = (
+            build_atempo(
+                voice_speed
+            )
+        )
+
+        # ==================================================
+        # VIDEO FILTERS
+        # ==================================================
 
         filters = []
         video_inputs = []
 
-        for i, clip in enumerate(fixed_plan):
+        for i, clip in enumerate(
+            fixed_plan
+        ):
 
-            start = clip["source_start"]
-            duration = clip["duration"]
+            start = clip[
+                "source_start"
+            ]
+
+            duration = clip[
+                "duration"
+            ]
 
             label = f"v{i}"
 
             filters.append(
                 f"[0:v]"
-                f"trim=start={start}:duration={duration},"
+                f"trim=start={start}:"
+                f"duration={duration},"
                 f"setpts=PTS-STARTPTS"
                 f"[{label}]"
             )
@@ -386,25 +529,25 @@ def render():
                 f"[{label}]"
             )
 
+        # ==================================================
+        # CONCAT + 30 FPS
+        # ==================================================
+
         video_filter = (
             ";".join(filters)
             + ";"
             + "".join(video_inputs)
-            + f"concat=n={len(fixed_plan)}:v=1:a=0[vout]"
+            + f"concat=n={len(fixed_plan)}:"
+            f"v=1:a=0,"
+            f"fps=30"
+            f"[vout]"
         )
 
-        # Audio: speed if needed, then pad so final always reaches 20s
-        if voice_speed > 1.0001:
-            audio_filter = (
-                f"[1:a]"
-                f"atempo={voice_speed:.6f},"
-                f"apad"
-                f"[aout]"
-            )
-        else:
-            audio_filter = (
-                "[1:a]apad[aout]"
-            )
+        audio_filter = (
+            f"[1:a]"
+            f"{audio_chain}"
+            f"[aout]"
+        )
 
         filter_complex = (
             video_filter
@@ -412,9 +555,9 @@ def render():
             + audio_filter
         )
 
-        # ======================================================
-        # FINAL ONE-PASS RENDER
-        # ======================================================
+        # ==================================================
+        # FAST ONE-PASS RENDER
+        # ==================================================
 
         cmd = [
             "ffmpeg",
@@ -442,7 +585,7 @@ def render():
             "ultrafast",
 
             "-crf",
-            "26",
+            "28",
 
             "-pix_fmt",
             "yuv420p",
@@ -454,9 +597,8 @@ def render():
             "aac",
 
             "-b:a",
-            "160k",
+            "128k",
 
-            # FINAL OUTPUT ALWAYS 20.0s
             "-t",
             "20.000",
 
@@ -474,10 +616,15 @@ def render():
         )
 
         if p.returncode != 0:
+
             raise RuntimeError(
                 "FFMPEG RENDER ERROR:\n"
                 + p.stderr[-8000:]
             )
+
+        # ==================================================
+        # RETURN
+        # ==================================================
 
         return send_file(
             output,
@@ -487,12 +634,14 @@ def render():
         )
 
     except Exception as e:
+
         return jsonify({
             "error": str(e)
         }), 500
 
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=int(
