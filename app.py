@@ -15,7 +15,7 @@ def download_file(url, dst):
         r.raise_for_status()
 
         with open(dst, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
@@ -41,7 +41,6 @@ def render():
         voiceover_url = data["voiceover_url"]
         clip_plan = data["clip_plan"]
 
-        # Make may send clip_plan as JSON text
         if isinstance(clip_plan, str):
             clip_plan = json.loads(clip_plan)
 
@@ -51,228 +50,120 @@ def render():
             }), 400
 
         # ==========================================================
-        # TEMP WORK DIRECTORY
+        # TEMP FILES
         # ==========================================================
 
-        work = Path(
-            tempfile.mkdtemp(prefix="render_")
-        )
+        work = Path(tempfile.mkdtemp(prefix="render_"))
 
         master = work / "master.mp4"
         voice = work / "voice.mp3"
-        output = work / "output.mp4"
+        output = work / "rendered.mp4"
 
         # ==========================================================
-        # DOWNLOAD MASTER + VOICEOVER
+        # DOWNLOAD INPUT FILES
         # ==========================================================
 
         download_file(master_url, master)
         download_file(voiceover_url, voice)
 
         # ==========================================================
-        # LOW-MEMORY VIDEO RENDER
-        #
-        # Instead of loading every trim into one filter_complex,
-        # process ONE segment at a time.
-        # This keeps RAM usage much lower.
+        # BUILD ONE FILTER GRAPH
         # ==========================================================
 
-        segment_paths = []
-        total = 0.0
+        filters = []
+        concat_inputs = []
+        total_duration = 0.0
 
         for i, clip in enumerate(clip_plan):
 
-            start = float(
-                clip["source_start"]
-            )
+            start = float(clip["source_start"])
 
             if "clip_duration" in clip:
-                dur = float(
-                    clip["clip_duration"]
-                )
+                duration = float(clip["clip_duration"])
 
             elif "duration" in clip:
-                dur = float(
-                    clip["duration"]
-                )
+                duration = float(clip["duration"])
 
             else:
-                dur = (
+                duration = (
                     float(clip["source_end"])
                     - start
                 )
 
-            if dur <= 0:
+            if duration <= 0:
                 raise ValueError(
                     f"Invalid duration for clip {i}"
                 )
 
-            total += dur
+            total_duration += duration
 
-            segment = (
-                work
-                / f"segment_{i:02d}.mp4"
+            label = f"v{i}"
+
+            filters.append(
+                f"[0:v]"
+                f"trim=start={start}:duration={duration},"
+                f"setpts=PTS-STARTPTS"
+                f"[{label}]"
             )
 
-            segment_paths.append(
-                segment
+            concat_inputs.append(
+                f"[{label}]"
             )
 
-            # ------------------------------------------------------
-            # Render one small clip at a time
-            # ------------------------------------------------------
-
-            seg_cmd = [
-                "ffmpeg",
-                "-y",
-
-                # Seek before decoding
-                "-ss",
-                f"{start:.3f}",
-
-                "-i",
-                str(master),
-
-                "-t",
-                f"{dur:.3f}",
-
-                # Remove master audio
-                "-an",
-
-                # Low-memory / fast encoding
-                "-c:v",
-                "libx264",
-
-                "-preset",
-                "ultrafast",
-
-                "-crf",
-                "23",
-
-                "-pix_fmt",
-                "yuv420p",
-
-                # Important for low memory
-                "-threads",
-                "1",
-
-                "-movflags",
-                "+faststart",
-
-                str(segment)
-            ]
-
-            p = subprocess.run(
-                seg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            if p.returncode != 0:
-                raise RuntimeError(
-                    "SEGMENT RENDER ERROR:\n"
-                    + p.stderr[-6000:]
-                )
-
-        # ==========================================================
-        # CONCAT SEGMENTS
-        # ==========================================================
-
-        concat_list = (
-            work / "concat.txt"
+        filter_complex = (
+            ";".join(filters)
+            + ";"
+            + "".join(concat_inputs)
+            + f"concat=n={len(clip_plan)}:v=1:a=0[vout];"
+            + "[1:a]atempo=1.12,apad[aout]"
         )
 
-        with open(
-            concat_list,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            for segment in segment_paths:
-                f.write(
-                    f"file '{segment}'\n"
-                )
-
-        joined = (
-            work / "joined.mp4"
-        )
-
-        concat_cmd = [
-            "ffmpeg",
-            "-y",
-
-            "-f",
-            "concat",
-
-            "-safe",
-            "0",
-
-            "-i",
-            str(concat_list),
-
-            # No re-encode here
-            "-c",
-            "copy",
-
-            "-movflags",
-            "+faststart",
-
-            str(joined)
-        ]
-
-        p = subprocess.run(
-            concat_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        if p.returncode != 0:
-            raise RuntimeError(
-                "CONCAT ERROR:\n"
-                + p.stderr[-6000:]
-            )
-
         # ==========================================================
-        # ADD VOICEOVER
-        #
-        # Original JSON2Video workflow used speed = 1.12,
-        # so reproduce it here using atempo=1.12.
+        # ONE-PASS FINAL RENDER
         # ==========================================================
 
-        final_cmd = [
+        cmd = [
             "ffmpeg",
             "-y",
 
             "-i",
-            str(joined),
+            str(master),
 
             "-i",
             str(voice),
 
             "-filter_complex",
-            "[1:a]atempo=1.12,apad[aout]",
+            filter_complex,
 
             "-map",
-            "0:v:0",
+            "[vout]",
 
             "-map",
             "[aout]",
 
-            # Keep rendered video as-is
             "-c:v",
-            "copy",
+            "libx264",
+
+            "-preset",
+            "ultrafast",
+
+            "-crf",
+            "26",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-threads",
+            "0",
 
             "-c:a",
             "aac",
 
             "-b:a",
-            "192k",
+            "160k",
 
-            # Stop at final video duration
             "-t",
-            f"{total:.3f}",
+            f"{total_duration:.3f}",
 
             "-movflags",
             "+faststart",
@@ -281,16 +172,16 @@ def render():
         ]
 
         p = subprocess.run(
-            final_cmd,
-            stdout=subprocess.PIPE,
+            cmd,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True
         )
 
         if p.returncode != 0:
             raise RuntimeError(
-                "FINAL AUDIO MIX ERROR:\n"
-                + p.stderr[-6000:]
+                "FFMPEG RENDER ERROR:\n"
+                + p.stderr[-8000:]
             )
 
         # ==========================================================
