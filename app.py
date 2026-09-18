@@ -79,8 +79,7 @@ def probe_duration(path):
 
     if p.returncode != 0:
         raise RuntimeError(
-            "FFPROBE ERROR:\n"
-            + p.stderr[-3000:]
+            "FFPROBE ERROR:\n" + p.stderr[-3000:]
         )
 
     try:
@@ -93,21 +92,24 @@ def probe_duration(path):
 
 
 # ==========================================================
-# VALIDATE FAL CLIP PLAN
+# VALIDATE FAL PLAN
 # ==========================================================
 
 def validate_clip_plan(raw_plan, master_duration):
     """
-    IMPORTANT:
-    FAL source_start/source_end are the edit decision.
+    FAL controls the creative edit.
 
-    DO NOT:
-    - extend source_end
-    - move source_start
-    - merge neighbouring clips
-    - replace clips with continuous master footage
+    We preserve:
+    - source_start
+    - source_end
+    - clip order
 
-    Only validate/clamp impossible timestamps.
+    We DO NOT:
+    - extend clips
+    - repeat clips
+    - add footage
+    - reorder clips
+    - merge clips
     """
 
     clips = []
@@ -120,16 +122,13 @@ def validate_clip_plan(raw_plan, master_duration):
         ):
             continue
 
-        start = float(
-            clip["source_start"]
-        )
+        try:
+            start = float(clip["source_start"])
+            end = float(clip["source_end"])
+        except (TypeError, ValueError):
+            continue
 
-        end = float(
-            clip["source_end"]
-        )
-
-        # Only clamp timestamps that are outside
-        # the actual master video.
+        # Clamp only impossible timestamps
         start = max(
             0.0,
             min(start, master_duration)
@@ -163,104 +162,27 @@ def validate_clip_plan(raw_plan, master_duration):
 
 
 # ==========================================================
-# BUILD 20 SECOND TIMELINE
-# ==========================================================
-
-def build_timeline(clips):
-    """
-    Preserve every FAL clip exactly.
-
-    If FAL plan is shorter than 20 sec:
-    repeat the SAME variation sequence.
-
-    The final repeated clip may be shortened
-    only to stop exactly at 20 sec.
-
-    We NEVER extend a clip into footage that
-    FAL did not select.
-    """
-
-    timeline = []
-
-    total = 0.0
-    index = 0
-
-    while total < TARGET_DURATION - 0.001:
-
-        source = clips[
-            index % len(clips)
-        ]
-
-        start = source[
-            "source_start"
-        ]
-
-        original_duration = source[
-            "duration"
-        ]
-
-        remaining = (
-            TARGET_DURATION - total
-        )
-
-        use_duration = min(
-            original_duration,
-            remaining
-        )
-
-        if use_duration >= MIN_CLIP_DURATION:
-
-            timeline.append({
-                "source_start": start,
-                "source_end": round(
-                    start + use_duration,
-                    3
-                ),
-                "duration": round(
-                    use_duration,
-                    3
-                )
-            })
-
-            total += use_duration
-
-        index += 1
-
-        # Safety guard
-        if index > 1000:
-            raise RuntimeError(
-                "Unable to build 20 second timeline"
-            )
-
-    return timeline
-
-
-# ==========================================================
 # ATEMPO
 # ==========================================================
 
 def build_atempo(speed):
     """
-    Chain atempo filters safely when required.
+    FFmpeg atempo supports 0.5–2.0 safely.
+    Chain filters when outside that range.
     """
-
-    if speed <= 1.0001:
-        return "apad"
 
     parts = []
 
     while speed > 2.0:
-        parts.append(
-            "atempo=2.0"
-        )
+        parts.append("atempo=2.0")
         speed /= 2.0
+
+    while speed < 0.5:
+        parts.append("atempo=0.5")
+        speed /= 0.5
 
     parts.append(
         f"atempo={speed:.6f}"
-    )
-
-    parts.append(
-        "apad"
     )
 
     return ",".join(parts)
@@ -275,7 +197,7 @@ def health():
     return {
         "ok": True,
         "service": "syiema-video-render",
-        "version": "fal-exact-cut-v2"
+        "version": "fal-diversity-v3"
     }
 
 
@@ -288,35 +210,17 @@ def render():
 
     try:
 
-        data = request.get_json(
-            force=True
-        )
+        data = request.get_json(force=True)
 
-        master_url = data[
-            "master_url"
-        ]
+        master_url = data["master_url"]
+        voiceover_url = data["voiceover_url"]
+        clip_plan = data["clip_plan"]
 
-        voiceover_url = data[
-            "voiceover_url"
-        ]
+        # Make sends Clip Plan as Long String
+        if isinstance(clip_plan, str):
+            clip_plan = json.loads(clip_plan)
 
-        clip_plan = data[
-            "clip_plan"
-        ]
-
-        # Make sends Clip Plan as a Long String.
-        if isinstance(
-            clip_plan,
-            str
-        ):
-            clip_plan = json.loads(
-                clip_plan
-            )
-
-        if not isinstance(
-            clip_plan,
-            list
-        ):
+        if not isinstance(clip_plan, list):
             return jsonify({
                 "error":
                 "clip_plan must be a JSON array"
@@ -330,30 +234,20 @@ def render():
 
 
         # ==================================================
-        # TEMP DIRECTORY
+        # TEMP
         # ==================================================
 
         work = Path(
-            tempfile.mkdtemp(
-                prefix="render_"
-            )
+            tempfile.mkdtemp(prefix="render_")
         )
 
-        master = (
-            work / "master.mp4"
-        )
-
-        voice = (
-            work / "voice.mp3"
-        )
-
-        output = (
-            work / "rendered.mp4"
-        )
+        master = work / "master.mp4"
+        voice = work / "voice.mp3"
+        output = work / "rendered.mp4"
 
 
         # ==================================================
-        # DOWNLOAD SOURCE FILES
+        # DOWNLOAD
         # ==================================================
 
         download_file(
@@ -368,82 +262,75 @@ def render():
 
 
         # ==================================================
-        # DURATIONS
+        # PROBE
         # ==================================================
 
-        master_duration = (
-            probe_duration(master)
+        master_duration = probe_duration(master)
+        voice_duration = probe_duration(voice)
+
+
+        # ==================================================
+        # PRESERVE FAL EDIT
+        # ==================================================
+
+        clips = validate_clip_plan(
+            clip_plan,
+            master_duration
         )
 
-        voice_duration = (
-            probe_duration(voice)
+        raw_video_duration = sum(
+            clip["duration"]
+            for clip in clips
         )
 
-
-        # ==================================================
-        # FAL EXACT CUTS
-        # ==================================================
-
-        fal_plan = (
-            validate_clip_plan(
-                clip_plan,
-                master_duration
-            )
-        )
-
-        timeline = (
-            build_timeline(
-                fal_plan
-            )
-        )
-
-
-        # ==================================================
-        # VO SPEED
-        # ==================================================
-
-        if voice_duration > TARGET_DURATION:
-
-            voice_speed = (
-                voice_duration
-                / TARGET_DURATION
+        if raw_video_duration <= 0:
+            raise ValueError(
+                "Invalid total clip duration"
             )
 
-        else:
-            voice_speed = 1.0
 
-        audio_chain = (
-            build_atempo(
-                voice_speed
-            )
+        # ==================================================
+        # VIDEO NORMALIZATION
+        # ==========================================================
+        #
+        # Example:
+        #
+        # FAL total = 18 sec
+        # Need final = 20 sec
+        #
+        # setpts multiplier:
+        # 20 / 18 = 1.111
+        #
+        # FAL total = 22 sec
+        # 20 / 22 = 0.909
+        #
+        # This changes playback speed slightly,
+        # NOT the creative clip selection.
+        # ==================================================
+
+        video_pts_multiplier = (
+            TARGET_DURATION
+            / raw_video_duration
         )
 
 
         # ==================================================
-        # VIDEO FILTERS
+        # VIDEO CLIPS
         # ==================================================
 
         filters = []
         video_inputs = []
 
-        for i, clip in enumerate(
-            timeline
-        ):
+        for i, clip in enumerate(clips):
 
-            start = clip[
-                "source_start"
-            ]
-
-            duration = clip[
-                "duration"
-            ]
+            start = clip["source_start"]
+            duration = clip["duration"]
 
             label = f"v{i}"
 
             filters.append(
                 f"[0:v]"
-                f"trim=start={start}:"
-                f"duration={duration},"
+                f"trim=start={start}:duration={duration},"
                 f"setpts=PTS-STARTPTS"
                 f"[{label}]"
             )
@@ -454,24 +341,48 @@ def render():
 
 
         # ==================================================
-        # CONCAT VIDEO
+        # CONCAT + NORMALIZE TO 20 SEC
         # ==================================================
 
         video_filter = (
             ";".join(filters)
             + ";"
             + "".join(video_inputs)
-            + f"concat=n={len(timeline)}:"
-            f"v=1:a=0,"
-            f"fps=30,"
-            f"setpts=PTS-STARTPTS"
-            f"[vout]"
+            + f"concat=n={len(clips)}:v=1:a=0,"
+            + f"setpts={video_pts_multiplier:.8f}*PTS,"
+            + "fps=30,"
+            + "setpts=PTS-STARTPTS"
+            + "[vout]"
         )
 
 
         # ==================================================
-        # AUDIO
+        # VOICEOVER
+        # ==========================================================
+        #
+        # If VO >20 sec:
+        # speed it up to fit.
+        #
+        # If VO <20 sec:
+        # keep natural speed and pad silence.
         # ==================================================
+
+        if voice_duration > TARGET_DURATION:
+
+            voice_speed = (
+                voice_duration
+                / TARGET_DURATION
+            )
+
+            audio_chain = (
+                build_atempo(voice_speed)
+                + ",apad"
+            )
+
+        else:
+
+            audio_chain = "apad"
+
 
         audio_filter = (
             f"[1:a]"
@@ -481,6 +392,10 @@ def render():
             f"[aout]"
         )
 
+
+        # ==================================================
+        # FILTER COMPLEX
+        # ==================================================
 
         filter_complex = (
             video_filter
@@ -558,12 +473,12 @@ def render():
 
 
         # ==================================================
-        # VERIFY OUTPUT
+        # VERIFY
         # ==================================================
 
         if not output.exists():
             raise RuntimeError(
-                "FFmpeg did not create output file"
+                "FFmpeg did not create output"
             )
 
         if output.stat().st_size < 1000:
@@ -573,7 +488,7 @@ def render():
 
 
         # ==================================================
-        # RETURN MP4
+        # RETURN
         # ==================================================
 
         return send_file(
@@ -592,7 +507,7 @@ def render():
 
 
 # ==========================================================
-# LOCAL START
+# START
 # ==========================================================
 
 if __name__ == "__main__":
